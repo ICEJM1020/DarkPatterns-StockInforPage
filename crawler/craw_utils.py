@@ -47,3 +47,10 @@ def move_to_element(driver, element):
         ActionChains(driver).move_to_element(element).perform()
     except WebDriverException:
         pass
+
+
+def if_same_tag(current_url, origin_url):
+    temp_c = current_url.replace("http://", "").replace("https://", "")
+    temp_o = origin_url.replace("http://", "").replace("https://", "")
+    return True if temp_c.startswith(temp_o) else False
+

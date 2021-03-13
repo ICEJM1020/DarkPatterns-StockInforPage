@@ -24,7 +24,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 
 from craw_utils import (get_tld_or_host, dump_as_json, safe_filename_from_url,
-                        move_to_element, write_to_file)
+                        move_to_element, write_to_file, if_same_tag)
 
 from multiprocessing_logging import install_mp_handler
 from selenium.webdriver.support.wait import WebDriverWait
@@ -40,6 +40,11 @@ class AccessDeniedError(Exception):
 
 class OffDomainNavigationError(Exception):
     """Crawler is redirected to a domain different than we want to visit."""
+    pass
+
+
+class OffTagNavigationError(Exception):
+    """Crawler is redirected to a tag different than we want to visit."""
     pass
 
 
@@ -73,9 +78,8 @@ OUTDIR = "output"
 ALLOWED_SCHEMES = ["http", "https"]
 
 # don't visit links with those words
-EXCLUDED_WORDS = ["login", "register", "subscribe", "sign in",
-                  "sign up", "add to cart", "checkout", "privacy policy",
-                  "contact us", "about us", "help"]
+EXCLUDED_WORDS = ["登录", "注册", "订阅", "忘记密码", "立即注册", "使用qq登录", "换个账号登录", "评论", "转发", "找回密码", "更多>>",
+                  "更多"]
 
 MAX_NUM_LINK_CHOICES = 200
 # fall back to random (non-area based) random
@@ -123,13 +127,14 @@ def get_prod_likelihoods(urls, as_dict=False):
 
 class Spider(object):
 
-    def __init__(self, top_url, max_level=5, max_links=50):
+    def __init__(self, top_url, upper_url, max_level=5, max_links=50):
         self.top_url = top_url
+        self.upper_url = upper_url
         self.max_level = max_level
         self.max_links = max_links
         self.observed_links = {}  # page url -> links
         self.visited_links = {}  # page number -> link
-        self.product_links = set()
+        self.potentdp_links = {}
         self.printed_skipped_urls = set()
         self.num_visited_pages = 0
         self.num_walks = 0
@@ -148,10 +153,10 @@ class Spider(object):
         self.page_src_file_name = join(self.outdir, 'PAGE_NO_URL.html')
         self.links_json_file_name = join(
             self.outdir, 'links_%s.json' % self.base_filename)
+        self.potent_json_file_name = join(
+            self.outdir, 'potent_links_%s.json' % self.base_filename)
         self.visited_links_json_file_name = join(
             self.outdir, 'visited_links_%s.json' % self.base_filename)
-        self.product_links_file_name = join(
-            self.outdir, 'product_links_%s.txt' % self.base_filename)
 
         #set firefox through selenium
         from selenium.webdriver.firefox.options import Options
@@ -214,19 +219,24 @@ class Spider(object):
         except NoAlertPresentException:
             pass
 
-    def visit_random_link(self, links,
-                          sel_method=LINK_SEL_PRODUCT_LIKELIHOOD_AND_EL_SIZE):
+    def visit_random_link(self, links, sel_method=LINK_SEL_PRODUCT_LIKELIHOOD_AND_EL_SIZE):
         if not links:
             return None
+
+        stay_link = self.driver.current_url
 
         link_areas = {}
         link_prod_likelihoods = {}
         tried_links = set()
         link_urls = list(set(links.keys()))
 
+        self.potentdp_links[stay_link] = []
+
         for url, link_details in links.items():
             link_areas[url] = link_details["area"]
             link_prod_likelihoods[url] = link_details["p_product"]
+            if link_details["p_product"] <= 0.1:
+                self.potentdp_links[stay_link].append(url)
 
         if sel_method == LINK_SEL_PRODUCT_LIKELIHOOD:
             probas = link_prod_likelihoods.items()
@@ -239,7 +249,7 @@ class Spider(object):
             else:
                 proba_area = link_prod_likelihoods.items()
             proba_area.sort(key=lambda x: x[1], reverse=True)
-
+        random_offset = random.randint(15, 30)
         num_choices = 0
         while len(tried_links) < len(link_urls) and (
                 num_choices < MAX_NUM_LINK_CHOICES):
@@ -256,7 +266,7 @@ class Spider(object):
                 continue
             # if we clicked/visited this link more than the limit
             if (self.link_visit_counts[link_url] >= MAX_NUM_VISITS_TO_SAME_LINK
-                    or link_url in self.product_links):
+                    or link_url in self.potentdp_links):
                 continue
 
             try:
@@ -264,6 +274,7 @@ class Spider(object):
             except OffDomainNavigationError:
                 logger.warning("Navigated away from the page %s on %s" %
                                (self.driver.current_url, self.top_url))
+                self.potentdp_links[stay_link].append(self.driver.current_url)
                 self.external_link_err_cnt += 1
                 if self.external_link_err_cnt > MAX_EXTERNAL_LINK_ERR:
                     raise TooManyOffDomainNavigationErrors()
@@ -277,13 +288,18 @@ class Spider(object):
                 self.timeout_err_cnt += 1
                 if self.timeout_err_cnt > MAX_TIMEOUT_ERRORS:
                     raise TooManyTimeoutErrors()
+            except OffTagNavigationError:
+                self.potentdp_links[stay_link].append(self.driver.current_url)
+                pass
             except Exception:
                 logger.exception("Exception while following the link %s on %s"
                                  % (link_url, self.top_url))
             else:
-                # logger.info("Visited a link after %s choices on %s" % (
-                #    num_choices, self.driver.current_url))
-                return link_url
+                if num_choices < random_offset:
+                    self.driver.back()
+                    pass
+                else:
+                    return link_url
 
             tried_links.add(link_url)
             if num_choices == MAX_CHOICES_BY_NON_RANDOM_METHODS:
@@ -331,32 +347,13 @@ class Spider(object):
             if tld != self.top_url_tld:  # is this the domain we want to visit?
                 self.blacklisted_links.add(url.rstrip('/').lower())
                 raise OffDomainNavigationError()
+        if not (if_same_tag(url, self.top_url) or if_same_tag(url, self.upper_url)):
+            self.blacklisted_links.add(url.rstrip('/').lower())
+            raise OffTagNavigationError()
+
         WebDriverWait(self.driver, 30).until(
             EC.presence_of_element_located((By.TAG_NAME, "body")))
         self.check_for_CF_gateway()
-
-    def get_page_language(self):
-        # we expect at least 64 chars to detect language
-        MIN_TEXT_LEN_TO_DETECT_LANG = 64
-        inner_text = self.get_page_text()
-        if not inner_text:
-            # this happens when document doesn't have a body
-            logger.warning("Cannot read page text: %s" % self.top_url)
-            return None
-        if len(inner_text) < MIN_TEXT_LEN_TO_DETECT_LANG:
-            logger.warning("Text is too short to detect language: %s %s" %
-                           (len(inner_text), self.top_url))
-            return None
-
-        try:
-            lang_detector = Detector(inner_text, quiet=True)
-        except Exception:
-            logger.exception("Exception while detecting language on %s" %
-                             self.top_url)
-            return None  # assume a non-english page if we can't detect
-        logger.info("Lang code: %s %s" % (self.top_url,
-                                          lang_detector.language.code))
-        return lang_detector.language.code
 
     def execute_dismiss_dialog(self):
         js = self.driver.execute_script
@@ -409,16 +406,6 @@ class Spider(object):
             return False
         return True
 
-    def is_english_page(self):
-        lang_code = self.get_page_language()
-        if lang_code is None:
-            logger.warn("Cannot detect language %s, will skip" % self.top_url)
-            return False
-        elif lang_code != "en":
-            logger.info("Will skip non-English page %s" % self.top_url)
-            return False
-        return lang_code
-
     def spider_site(self):
         links = {}
         MAX_SPIDERING_DURATION = 60*60  # in s
@@ -431,10 +418,6 @@ class Spider(object):
         if not self.load_home_page():
             return
 
-        # test if the page is en page
-        # if not self.is_english_page():
-        #     return
-
         # close dialog
         self.close_dialog()
 
@@ -444,25 +427,20 @@ class Spider(object):
             logger.error("Cannot find any links on the home page %s" % self.driver.current_url)
             return
 
-        # try to visit sales related links first
-        home_sales_links = self.get_sales_links(home_links)
-
         self.observed_links[self.top_url] = list(home_links.keys())
         while (self.num_walks < MAX_WALK_COUNT and
                self.num_visited_pages < self.max_links and
                (time() - self.t_start) < MAX_SPIDERING_DURATION and
-               (len(self.product_links) or (
+               (len(self.potentdp_links) or (
                    (time() - self.t_start) <
                    MAX_SPIDERING_DURATION_WITH_NOLINK)) and
-               len(self.product_links) < MAX_PROD_LINKS and
-               (len(self.product_links) or self.num_walks < MAX_WALK_COUNT/2)):
+               len(self.potentdp_links) < MAX_PROD_LINKS and
+               (len(self.potentdp_links) or self.num_walks < MAX_WALK_COUNT/2)):
             self.num_walks += 1
             for level in range(1, self.max_level+1):
+                stay_link = self.driver.current_url
                 if level == 1:
-                    if self.num_walks == 1:
-                        navigated_link = self.visit_random_link(home_sales_links)
-                    else:
-                        navigated_link = self.visit_random_link(home_links)
+                    navigated_link = self.visit_random_link(home_links)
                 else:
                     navigated_link = self.visit_random_link(links)
                 current_url = self.driver.current_url
@@ -477,7 +455,7 @@ class Spider(object):
                             "Failed visit using homepage links %s -"
                             "Link %s of %s. Level %s. nProdPages: %d." % (
                                 current_url, self.num_visited_pages,
-                                self.max_links, level, len(self.product_links))
+                                self.max_links, level, len(self.potentdp_links))
                             )
                     break
 
@@ -497,13 +475,14 @@ class Spider(object):
                 else:
                     logger.info("Link %s of %s. Level %s. nProdPages: %d. Navigated to %s. " % (
                                 self.num_visited_pages, self.max_links,
-                                level, len(self.product_links), navigated_link))
+                                level, len(self.potentdp_links), navigated_link))
                 self.dump_page_data(self.num_visited_pages, current_url)
-                if self.is_product_page():
-                    self.product_links.add(current_url)
+
+                if self.is_potent_page():
+                    self.potentdp_links[stay_link].append(navigated_link)
                     logger.info(
                         "Found a product page nProdPages: %d Link: %d %s" %
-                        (len(self.product_links), self.num_visited_pages,
+                        (len(self.potentdp_links), self.num_visited_pages,
                          current_url))
                     break  # don't follow links from a product page
 
@@ -520,28 +499,13 @@ class Spider(object):
             dump_as_json(self.observed_links, self.links_json_file_name)
         if self.visited_links:
             dump_as_json(self.visited_links, self.visited_links_json_file_name)
-        if self.product_links:
-            with open(self.product_links_file_name, "w") as f:
-                f.write("\n".join(self.product_links))
+        if self.potentdp_links:
+            dump_as_json(self.potentdp_links, self.potent_json_file_name)
         duration = (time() - self.t_start) / 60
         logger.info("Finished crawling %s in %0.1f mins."
                     " Visited %s pages, made %s walks, found %d product pages"
                     % (self.top_url, duration, self.num_visited_pages,
-                       self.num_walks, len(self.product_links)))
-
-    def get_sales_links(self, home_links):
-        home_sales_links = {}
-        SALES_KEYWORDS = ["sale", "clearance", "deal", "special",
-                          "offer", "outlet", "promotion"]
-
-        for link_url, link_details in home_links.items():
-            link_title = link_details["title"]
-            link_text = link_details["text"]
-            if any((sales_keyword in link_text.lower().split() or
-                    sales_keyword in link_title.lower().split())
-                   for sales_keyword in SALES_KEYWORDS):
-                home_sales_links[link_url] = link_details
-        return home_sales_links
+                       self.num_walks, len(self.potentdp_links)))
 
     def dump_page_data(self, link_no, current_url):
         driver = self.driver
@@ -563,7 +527,8 @@ class Spider(object):
         except Exception:
             return 0
 
-    def is_product_page(self):
+    def is_potent_page(self):
+        return False
         # random id to be able group together logs from the same page
         rand_id = randint(0, 2**32)
         url = self.driver.current_url
@@ -670,9 +635,8 @@ class Spider(object):
                 # exclude registration, login etc. links
                 link_text_lower = link_text.lower()
                 link_title_lower = link_title.lower()
-                if any((excluded_word == link_text_lower or
-                        excluded_word == link_title_lower)
-                       for excluded_word in EXCLUDED_WORDS):
+                if any((excluded_word == link_text_lower or excluded_word == link_title_lower)
+                       for excluded_word in EXCLUDED_WORDS) or (len(link_text_lower) < 2):
                     if href not in self.printed_skipped_urls:
                         # logger.info("Link contains excluded words, will skip:"
                         #            " %s - %s" % (link_element.text, href))
@@ -697,6 +661,12 @@ class Spider(object):
                 if link_url in links and (link_area <= links[link_url]["area"]):
                     continue
 
+                if link_area <= 0:
+                    continue
+
+                with open("words.csv", "a+") as f:
+                    f.write(link_text+","+link_title+"\n")
+
                 links[link_url] = {
                     "title": link_title,
                     "text": link_text,
@@ -714,20 +684,20 @@ class Spider(object):
         return links
 
 
-def crawl(url, max_level=5, max_links=200):
+def crawl(urls, max_level=5, max_links=200):
     spider = None
     try:
-        spider = Spider(url, max_level, max_links)
+        spider = Spider(urls[0], urls[1], max_level, max_links)
         spider.spider_site()
     except AccessDeniedError:
-        logger.warning("AccessDeniedError while spidering %s" % url)
+        logger.warning("AccessDeniedError while spidering %s" % urls[0])
     except TooManyOffDomainNavigationErrors:
         logger.error("TooManyOffDomainNavigationErrors while spidering %s" %
-                     url)
+                     urls[0])
     except TooManyTimeoutErrors:
-        logger.error("TooManyTimeoutErrors while spidering %s" % url)
+        logger.error("TooManyTimeoutErrors while spidering %s" % urls[0])
     except Exception:
-        logger.exception("Error while spidering %s" % url)
+        logger.exception("Error while spidering %s" % urls[0])
     finally:
         if spider is not None:
             spider.finalize_visit()
@@ -744,7 +714,7 @@ def get_urls_from_csv(csv_file):
             url = "http://" + domain
         else:
             url = domain
-        yield url
+        yield [url, items[1]]
 
 
 def main(csv_file):
@@ -765,7 +735,7 @@ def main(csv_file):
 
 if __name__ == '__main__':
     if DEBUG:
-        url = "https://www.sportsuncle.com/"
+        url = "http://finance.sina.com.cn/stock/"
         crawl(url, 5, 200)
     else:
         main(sys.argv[1])

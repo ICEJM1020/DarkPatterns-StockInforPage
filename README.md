@@ -15,8 +15,11 @@ In linux environment, you also have to have these 3rd-packages:
     RabbitMQ(Broker of celery): 
     https://www.rabbitmq.com/install-debian.html`
 
-    libicu(C/C++ Version): 
+    libicu(C/C++ Version) (No use actually, original version's dependency): 
     http://site.icu-project.org/download/68#TOC-ICU4C-Download
+
+    Xvf:
+    https://www.x.org/releases/X11R7.6/doc/man/man1/Xvfb.1.xhtml
 
 
     
